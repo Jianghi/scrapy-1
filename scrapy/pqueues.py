@@ -1,16 +1,33 @@
+from __future__ import annotations
+
 import hashlib
 import logging
-from collections import namedtuple
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Type,
+    cast,
+)
 
-from queuelib import PriorityQueue
+from scrapy import Request
+from scrapy.core.downloader import Downloader
+from scrapy.utils.misc import build_from_crawler
 
-from scrapy.utils.reqser import request_to_dict, request_from_dict
+if TYPE_CHECKING:
+    # typing.Self requires Python 3.11
+    from typing_extensions import Self
 
+    from scrapy.crawler import Crawler
 
 logger = logging.getLogger(__name__)
 
 
-def _path_safe(text):
+def _path_safe(text: str) -> str:
     """
     Return a filesystem-safe version of a string ``text``
 
@@ -21,173 +38,256 @@ def _path_safe(text):
     >>> _path_safe('some@symbol?').startswith('some_symbol_')
     True
     """
-    pathable_slot = "".join([c if c.isalnum() or c in '-._' else '_'
-                             for c in text])
+    pathable_slot = "".join([c if c.isalnum() or c in "-._" else "_" for c in text])
     # as we replace some letters we can get collision for different slots
     # add we add unique part
-    unique_slot = hashlib.md5(text.encode('utf8')).hexdigest()
-    return '-'.join([pathable_slot, unique_slot])
+    unique_slot = hashlib.md5(text.encode("utf8")).hexdigest()  # nosec
+    return "-".join([pathable_slot, unique_slot])
 
 
-class _Priority(namedtuple("_Priority", ["priority", "slot"])):
-    """ Slot-specific priority. It is a hack - ``(priority, slot)`` tuple
-    which can be used instead of int priorities in queues:
+class QueueProtocol(Protocol):
+    """Protocol for downstream queues of ``ScrapyPriorityQueue``."""
 
-    * they are ordered in the same way - order is still by priority value,
-      min(prios) works;
-    * str(p) representation is guaranteed to be different when slots
-      are different - this is important because str(p) is used to create
-      queue files on disk;
-    * they have readable str(p) representation which is safe
-      to use as a file name.
+    def push(self, request: Request) -> None: ...
+
+    def pop(self) -> Optional[Request]: ...
+
+    def close(self) -> None: ...
+
+    def __len__(self) -> int: ...
+
+
+class ScrapyPriorityQueue:
+    """A priority queue implemented using multiple internal queues (typically,
+    FIFO queues). It uses one internal queue for each priority value. The internal
+    queue must implement the following methods:
+
+        * push(obj)
+        * pop()
+        * close()
+        * __len__()
+
+    Optionally, the queue could provide a ``peek`` method, that should return the
+    next object to be returned by ``pop``, but without removing it from the queue.
+
+    ``__init__`` method of ScrapyPriorityQueue receives a downstream_queue_cls
+    argument, which is a class used to instantiate a new (internal) queue when
+    a new priority is allocated.
+
+    Only integer priorities should be used. Lower numbers are higher
+    priorities.
+
+    startprios is a sequence of priorities to start with. If the queue was
+    previously closed leaving some priority buckets non-empty, those priorities
+    should be passed in startprios.
+
     """
-    __slots__ = ()
 
-    def __str__(self):
-        return '%s_%s' % (self.priority, _path_safe(str(self.slot)))
+    @classmethod
+    def from_crawler(
+        cls,
+        crawler: Crawler,
+        downstream_queue_cls: Type[QueueProtocol],
+        key: str,
+        startprios: Iterable[int] = (),
+    ) -> Self:
+        return cls(crawler, downstream_queue_cls, key, startprios)
 
+    def __init__(
+        self,
+        crawler: Crawler,
+        downstream_queue_cls: Type[QueueProtocol],
+        key: str,
+        startprios: Iterable[int] = (),
+    ):
+        self.crawler: Crawler = crawler
+        self.downstream_queue_cls: Type[QueueProtocol] = downstream_queue_cls
+        self.key: str = key
+        self.queues: Dict[int, QueueProtocol] = {}
+        self.curprio: Optional[int] = None
+        self.init_prios(startprios)
 
-class _SlotPriorityQueues(object):
-    """ Container for multiple priority queues. """
-    def __init__(self, pqfactory, slot_startprios=None):
+    def init_prios(self, startprios: Iterable[int]) -> None:
+        if not startprios:
+            return
+
+        for priority in startprios:
+            self.queues[priority] = self.qfactory(priority)
+
+        self.curprio = min(startprios)
+
+    def qfactory(self, key: int) -> QueueProtocol:
+        return build_from_crawler(
+            self.downstream_queue_cls,
+            self.crawler,
+            self.key + "/" + str(key),
+        )
+
+    def priority(self, request: Request) -> int:
+        return -request.priority
+
+    def push(self, request: Request) -> None:
+        priority = self.priority(request)
+        if priority not in self.queues:
+            self.queues[priority] = self.qfactory(priority)
+        q = self.queues[priority]
+        q.push(request)  # this may fail (eg. serialization error)
+        if self.curprio is None or priority < self.curprio:
+            self.curprio = priority
+
+    def pop(self) -> Optional[Request]:
+        if self.curprio is None:
+            return None
+        q = self.queues[self.curprio]
+        m = q.pop()
+        if not q:
+            del self.queues[self.curprio]
+            q.close()
+            prios = [p for p, q in self.queues.items() if q]
+            self.curprio = min(prios) if prios else None
+        return m
+
+    def peek(self) -> Optional[Request]:
+        """Returns the next object to be returned by :meth:`pop`,
+        but without removing it from the queue.
+
+        Raises :exc:`NotImplementedError` if the underlying queue class does
+        not implement a ``peek`` method, which is optional for queues.
         """
-        ``pqfactory`` is a factory for creating new PriorityQueues.
-        It must be a function which accepts a single optional ``startprios``
-        argument, with a list of priorities to create queues for.
+        if self.curprio is None:
+            return None
+        queue = self.queues[self.curprio]
+        # Protocols can't declare optional members
+        return cast(Request, queue.peek())  # type: ignore[attr-defined]
 
-        ``slot_startprios`` is a ``{slot: startprios}`` dict.
-        """
-        self.pqfactory = pqfactory
-        self.pqueues = {}  # slot -> priority queue
+    def close(self) -> List[int]:
+        active: List[int] = []
+        for p, q in self.queues.items():
+            active.append(p)
+            q.close()
+        return active
+
+    def __len__(self) -> int:
+        return sum(len(x) for x in self.queues.values()) if self.queues else 0
+
+
+class DownloaderInterface:
+    def __init__(self, crawler: Crawler):
+        assert crawler.engine
+        self.downloader: Downloader = crawler.engine.downloader
+
+    def stats(self, possible_slots: Iterable[str]) -> List[Tuple[int, str]]:
+        return [(self._active_downloads(slot), slot) for slot in possible_slots]
+
+    def get_slot_key(self, request: Request) -> str:
+        return self.downloader.get_slot_key(request)
+
+    def _active_downloads(self, slot: str) -> int:
+        """Return a number of requests in a Downloader for a given slot"""
+        if slot not in self.downloader.slots:
+            return 0
+        return len(self.downloader.slots[slot].active)
+
+
+class DownloaderAwarePriorityQueue:
+    """PriorityQueue which takes Downloader activity into account:
+    domains (slots) with the least amount of active downloads are dequeued
+    first.
+    """
+
+    @classmethod
+    def from_crawler(
+        cls,
+        crawler: Crawler,
+        downstream_queue_cls: Type[QueueProtocol],
+        key: str,
+        startprios: Optional[Dict[str, Iterable[int]]] = None,
+    ) -> Self:
+        return cls(crawler, downstream_queue_cls, key, startprios)
+
+    def __init__(
+        self,
+        crawler: Crawler,
+        downstream_queue_cls: Type[QueueProtocol],
+        key: str,
+        slot_startprios: Optional[Dict[str, Iterable[int]]] = None,
+    ):
+        if crawler.settings.getint("CONCURRENT_REQUESTS_PER_IP") != 0:
+            raise ValueError(
+                f'"{self.__class__}" does not support CONCURRENT_REQUESTS_PER_IP'
+            )
+
+        if slot_startprios and not isinstance(slot_startprios, dict):
+            raise ValueError(
+                "DownloaderAwarePriorityQueue accepts "
+                "``slot_startprios`` as a dict; "
+                f"{slot_startprios.__class__!r} instance "
+                "is passed. Most likely, it means the state is"
+                "created by an incompatible priority queue. "
+                "Only a crawl started with the same priority "
+                "queue class can be resumed."
+            )
+
+        self._downloader_interface: DownloaderInterface = DownloaderInterface(crawler)
+        self.downstream_queue_cls: Type[QueueProtocol] = downstream_queue_cls
+        self.key: str = key
+        self.crawler: Crawler = crawler
+
+        self.pqueues: Dict[str, ScrapyPriorityQueue] = {}  # slot -> priority queue
         for slot, startprios in (slot_startprios or {}).items():
-            self.pqueues[slot] = self.pqfactory(startprios)
+            self.pqueues[slot] = self.pqfactory(slot, startprios)
 
-    def pop_slot(self, slot):
-        """ Pop an object from a priority queue for this slot """
+    def pqfactory(
+        self, slot: str, startprios: Iterable[int] = ()
+    ) -> ScrapyPriorityQueue:
+        return ScrapyPriorityQueue(
+            self.crawler,
+            self.downstream_queue_cls,
+            self.key + "/" + _path_safe(slot),
+            startprios,
+        )
+
+    def pop(self) -> Optional[Request]:
+        stats = self._downloader_interface.stats(self.pqueues)
+
+        if not stats:
+            return None
+
+        slot = min(stats)[1]
         queue = self.pqueues[slot]
         request = queue.pop()
         if len(queue) == 0:
             del self.pqueues[slot]
         return request
 
-    def push_slot(self, slot, obj, priority):
-        """ Push an object to a priority queue for this slot """
+    def push(self, request: Request) -> None:
+        slot = self._downloader_interface.get_slot_key(request)
         if slot not in self.pqueues:
-            self.pqueues[slot] = self.pqfactory()
+            self.pqueues[slot] = self.pqfactory(slot)
         queue = self.pqueues[slot]
-        queue.push(obj, priority)
+        queue.push(request)
 
-    def close(self):
-        active = {slot: queue.close()
-                  for slot, queue in self.pqueues.items()}
+    def peek(self) -> Optional[Request]:
+        """Returns the next object to be returned by :meth:`pop`,
+        but without removing it from the queue.
+
+        Raises :exc:`NotImplementedError` if the underlying queue class does
+        not implement a ``peek`` method, which is optional for queues.
+        """
+        stats = self._downloader_interface.stats(self.pqueues)
+        if not stats:
+            return None
+        slot = min(stats)[1]
+        queue = self.pqueues[slot]
+        return queue.peek()
+
+    def close(self) -> Dict[str, List[int]]:
+        active = {slot: queue.close() for slot, queue in self.pqueues.items()}
         self.pqueues.clear()
         return active
 
-    def __len__(self):
+    def __len__(self) -> int:
         return sum(len(x) for x in self.pqueues.values()) if self.pqueues else 0
 
-    def __contains__(self, slot):
+    def __contains__(self, slot: str) -> bool:
         return slot in self.pqueues
-
-
-class ScrapyPriorityQueue(PriorityQueue):
-    """
-    PriorityQueue which works with scrapy.Request instances and
-    can optionally convert them to/from dicts before/after putting to a queue.
-    """
-    def __init__(self, crawler, qfactory, startprios=(), serialize=False):
-        super(ScrapyPriorityQueue, self).__init__(qfactory, startprios)
-        self.serialize = serialize
-        self.spider = crawler.spider
-
-    @classmethod
-    def from_crawler(cls, crawler, qfactory, startprios=(), serialize=False):
-        return cls(crawler, qfactory, startprios, serialize)
-
-    def push(self, request, priority=0):
-        if self.serialize:
-            request = request_to_dict(request, self.spider)
-        super(ScrapyPriorityQueue, self).push(request, priority)
-
-    def pop(self):
-        request = super(ScrapyPriorityQueue, self).pop()
-        if request and self.serialize:
-            request = request_from_dict(request, self.spider)
-        return request
-
-
-class DownloaderInterface(object):
-
-    def __init__(self, crawler):
-        self.downloader = crawler.engine.downloader
-
-    def stats(self, possible_slots):
-        return [(self._active_downloads(slot), slot)
-                for slot in possible_slots]
-
-    def get_slot_key(self, request):
-        return self.downloader._get_slot_key(request, None)
-
-    def _active_downloads(self, slot):
-        """ Return a number of requests in a Downloader for a given slot """
-        if slot not in self.downloader.slots:
-            return 0
-        return len(self.downloader.slots[slot].active)
-
-
-class DownloaderAwarePriorityQueue(object):
-    """ PriorityQueue which takes Downlaoder activity in account:
-    domains (slots) with the least amount of active downloads are dequeued
-    first.
-    """
-
-    @classmethod
-    def from_crawler(cls, crawler, qfactory, slot_startprios=None, serialize=False):
-        return cls(crawler, qfactory, slot_startprios, serialize)
-
-    def __init__(self, crawler, qfactory, slot_startprios=None, serialize=False):
-        if crawler.settings.getint('CONCURRENT_REQUESTS_PER_IP') != 0:
-            raise ValueError('"%s" does not support CONCURRENT_REQUESTS_PER_IP'
-                             % (self.__class__,))
-
-        if slot_startprios and not isinstance(slot_startprios, dict):
-            raise ValueError("DownloaderAwarePriorityQueue accepts "
-                             "``slot_startprios`` as a dict; %r instance "
-                             "is passed. Most likely, it means the state is"
-                             "created by an incompatible priority queue. "
-                             "Only a crawl started with the same priority "
-                             "queue class can be resumed." %
-                             slot_startprios.__class__)
-
-        slot_startprios = {
-            slot: [_Priority(p, slot) for p in startprios]
-            for slot, startprios in (slot_startprios or {}).items()}
-
-        def pqfactory(startprios=()):
-            return ScrapyPriorityQueue(crawler, qfactory, startprios, serialize)
-        self._slot_pqueues = _SlotPriorityQueues(pqfactory, slot_startprios)
-        self.serialize = serialize
-        self._downloader_interface = DownloaderInterface(crawler)
-
-    def pop(self):
-        stats = self._downloader_interface.stats(self._slot_pqueues.pqueues)
-
-        if not stats:
-            return
-
-        slot = min(stats)[1]
-        request = self._slot_pqueues.pop_slot(slot)
-        return request
-
-    def push(self, request, priority):
-        slot = self._downloader_interface.get_slot_key(request)
-        priority_slot = _Priority(priority=priority, slot=slot)
-        self._slot_pqueues.push_slot(slot, request, priority_slot)
-
-    def close(self):
-        active = self._slot_pqueues.close()
-        return {slot: [p.priority for p in startprios]
-                for slot, startprios in active.items()}
-
-    def __len__(self):
-        return len(self._slot_pqueues)
